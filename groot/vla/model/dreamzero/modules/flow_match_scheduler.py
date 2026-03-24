@@ -48,8 +48,12 @@ class FlowMatchScheduler():
         if to_final or timestep_id + 1 >= len(self.timesteps):
             sigma_ = 1 if (self.inverse_timesteps or self.reverse_sigmas) else 0
         else:
+            # sigma_ 是下一个时间步的 sigma, 距离干净动作更近
             sigma_ = self.sigmas[timestep_id + 1]
+        # 沿着 velocity 方向走一小步，把 noisy 往干净方向推
         prev_sample = sample + model_output * (sigma_ - sigma)
+        
+        
         return prev_sample
     
 
@@ -70,6 +74,7 @@ class FlowMatchScheduler():
     #     sample = (1 - sigma) * original_samples + sigma * noise
     #     return sample
     
+    # 给 clean action 加噪，得到 noisy_action，喂给模型。
     def add_noise(self, original_samples, noise, timestep):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
@@ -80,11 +85,13 @@ class FlowMatchScheduler():
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample
 
+    
+    # 定义训练目标是什么
     def training_target(self, sample, noise, timestep):
         target = noise - sample
         return target
     
-
+    #   按 timestep 给 loss 加权重，是一个钟形曲线（高斯形状），中间 timestep 权重高，两端低。
     def training_weight(self, timestep):
         # timestep_id = torch.argmin((self.timesteps - timestep.to(self.timesteps.device)).abs())
         timestep_id = torch.argmin((self.timesteps.unsqueeze(1) - timestep.unsqueeze(0).to(self.timesteps.device)).abs(), dim = 0) 

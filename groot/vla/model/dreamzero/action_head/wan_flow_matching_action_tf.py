@@ -233,7 +233,7 @@ class WANPolicyHead(ActionHead):
         self.input_embedding_dim = config.input_embedding_dim
 
         self.cpu_offload = False
-
+        # 这里初始化的是CasualWanModel
         self.model = instantiate(config.diffusion_model_cfg)
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
@@ -746,11 +746,13 @@ class WANPolicyHead(ActionHead):
         
         if actions.numel() > 0:
             timestep_action = self.scheduler.timesteps[timestep_action_id].to(self._device)
+            # 对干净的动作添加噪声
             noisy_actions = self.scheduler.add_noise(
                 actions.flatten(0, 1),
                 noise_action.flatten(0, 1),
                 timestep_action.flatten(0, 1),
             ).unflatten(0, (noise_action.shape[0], noise_action.shape[1]))
+            # 算训练目标（当前是 velocity = noise - x0）
             training_target_action = self.scheduler.training_target(actions, noise_action, timestep_action)
         else:
             timestep_action = None
@@ -789,8 +791,15 @@ class WANPolicyHead(ActionHead):
             weighted_dynamics_loss = weight_dynamics.mean()
             
             if actions.numel() > 0:
+                # x0 prediction: action_noise_pred is x0_pred, convert to velocity
+                # velocity = (noisy - x0_pred) / sigma, derived from: noisy = (1-σ)*x0 + σ*noise
+                sigma_action = self.scheduler.sigmas[timestep_action_id].to(device=self._device, dtype=action_noise_pred.dtype)
+                while len(sigma_action.shape) < len(action_noise_pred.shape):
+                    sigma_action = sigma_action.unsqueeze(-1)
+                action_velocity_pred = (noisy_actions - action_noise_pred) / (sigma_action + 0.01)
+                
                 action_loss_per_sample = torch.nn.functional.mse_loss(
-                    action_noise_pred.float(), training_target_action.float(), reduction='none'
+                    action_velocity_pred.float(), training_target_action.float(), reduction='none'
                 ) * action_mask  # shape: [B, ...]
                 action_loss_per_sample = has_real_action[:, None].float() * action_loss_per_sample  # apply has_real_action
                 weight_action = action_loss_per_sample.mean(dim=2) * self.scheduler.training_weight(
@@ -1295,9 +1304,12 @@ class WANPolicyHead(ActionHead):
                 return_dict=False,
             )[0]
             
-            # Action: always fully denoises with standard schedule (1000->0)
+            # Action: x0 prediction → convert to velocity before scheduler step
+            # velocity = (noisy - x0_pred) / sigma, from: noisy = (1-σ)*x0 + σ*noise
+            sigma_t = sample_scheduler_action.sigmas[index]
+            action_velocity = (noisy_input_action - flow_pred_cond_action) / (sigma_t + 0.01)
             noisy_input_action = sample_scheduler_action.step(
-                model_output=flow_pred_cond_action,
+                model_output=action_velocity,
                 timestep=action_timestep,
                 sample=noisy_input_action,
                 step_index=index,
