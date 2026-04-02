@@ -104,5 +104,7 @@ action_head_cfg:
     video_noise_beta_alpha: 3.0
     video_noise_beta_beta: 1.0
 
+    # Action prediction type: "x0" (model outputs clean action) or "velocity" (model outputs velocity directly)
+    action_prediction_type: "x0"
     tune_projector: true
     tune_diffusion_model: true

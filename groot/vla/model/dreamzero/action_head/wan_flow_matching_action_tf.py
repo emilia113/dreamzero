@@ -142,6 +142,8 @@ class WANPolicyHeadConfig(PretrainedConfig):
     expand_batch: int = field(default=None)
     use_vlln: bool = field(default=True)
     defer_lora_injection: bool = field(default=False, metadata={"help": "Defer LoRA injection until after loading pretrained weights."})
+    # Action prediction type: "x0" = model outputs clean action, "velocity" = model outputs velocity directly
+    action_prediction_type: str = field(default="x0", metadata={"help": "Action prediction type: 'x0' (clean action) or 'velocity' (direct velocity)."})
 
     vl_self_attention_cfg: dict = field(default=None)
     text_encoder_cfg: dict = field(default=None)
@@ -791,13 +793,19 @@ class WANPolicyHead(ActionHead):
             weighted_dynamics_loss = weight_dynamics.mean()
             
             if actions.numel() > 0:
-                # x0 prediction: action_noise_pred is x0_pred, convert to velocity
-                # velocity = (noisy - x0_pred) / sigma, derived from: noisy = (1-σ)*x0 + σ*noise
-                sigma_action = self.scheduler.sigmas[timestep_action_id].to(device=self._device, dtype=action_noise_pred.dtype)
-                while len(sigma_action.shape) < len(action_noise_pred.shape):
-                    sigma_action = sigma_action.unsqueeze(-1)
-                action_velocity_pred = (noisy_actions - action_noise_pred) / (sigma_action + 0.01)
-                
+                if self.config.action_prediction_type == "x0":
+                    # x0 prediction: action_noise_pred is x0_pred, convert to velocity
+                    # velocity = (noisy - x0_pred) / sigma, derived from: noisy = (1-σ)*x0 + σ*noise
+                    sigma_action = self.scheduler.sigmas[timestep_action_id].to(device=self._device, dtype=action_noise_pred.dtype)
+                    while len(sigma_action.shape) < len(action_noise_pred.shape):
+                        sigma_action = sigma_action.unsqueeze(-1)
+                    action_velocity_pred = (noisy_actions - action_noise_pred) / (sigma_action + 0.01)
+                elif self.config.action_prediction_type == "velocity":
+                    # velocity prediction: model directly outputs velocity
+                    action_velocity_pred = action_noise_pred
+                else:
+                    raise ValueError(f"Unsupported action_prediction_type: {self.config.action_prediction_type}")
+
                 action_loss_per_sample = torch.nn.functional.mse_loss(
                     action_velocity_pred.float(), training_target_action.float(), reduction='none'
                 ) * action_mask  # shape: [B, ...]
@@ -1304,10 +1312,17 @@ class WANPolicyHead(ActionHead):
                 return_dict=False,
             )[0]
             
-            # Action: x0 prediction → convert to velocity before scheduler step
-            # velocity = (noisy - x0_pred) / sigma, from: noisy = (1-σ)*x0 + σ*noise
-            sigma_t = sample_scheduler_action.sigmas[index]
-            action_velocity = (noisy_input_action - flow_pred_cond_action) / (sigma_t + 0.01)
+            # Action: convert model output to velocity for scheduler step
+            if self.config.action_prediction_type == "x0":
+                # x0 prediction → convert to velocity
+                # velocity = (noisy - x0_pred) / sigma, from: noisy = (1-σ)*x0 + σ*noise
+                sigma_t = sample_scheduler_action.sigmas[index]
+                action_velocity = (noisy_input_action - flow_pred_cond_action) / (sigma_t + 0.01)
+            elif self.config.action_prediction_type == "velocity":
+                # velocity prediction: model directly outputs velocity
+                action_velocity = flow_pred_cond_action
+            else:
+                raise ValueError(f"Unsupported action_prediction_type: {self.config.action_prediction_type}")
             noisy_input_action = sample_scheduler_action.step(
                 model_output=action_velocity,
                 timestep=action_timestep,

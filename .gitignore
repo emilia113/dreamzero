@@ -244,3 +244,10 @@ groot/control/envs/yam/data/eval/*
 
 checkpoints/
 video_pred_output*/
+
+# Eval environments (cloned separately)
+molmospaces/
+sim-evals/
+
+# Paper archives
+*.tar.gz
