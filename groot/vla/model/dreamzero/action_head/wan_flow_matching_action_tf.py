@@ -322,6 +322,9 @@ class WANPolicyHead(ActionHead):
         self._noise_logged = False
         self.defer_lora_injection = config.defer_lora_injection
         print("defer_lora_injection@@", self.defer_lora_injection)
+        print(f"[Training Config] action_prediction_type: {config.action_prediction_type}")
+        print(f"[Training Config] lora_rank: {config.lora_rank}, lora_alpha: {config.lora_alpha}")
+        print(f"[Training Config] train_architecture: {config.train_architecture}")
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
