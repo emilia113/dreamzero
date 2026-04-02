@@ -90,26 +90,59 @@ class HuggingfaceTokenizer:
 
 
 def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodiment_tag_mapping=None) -> dict:
+    """
+    将 DataLoader 采样的多个样本 (features: List[dict]) 合并成一个 batch (dict of tensors)。
+
+    参数:
+        features: 一个 batch 的样本列表，每个样本是 dict，包含 text, images, action, state 等字段
+        tokenizer: HuggingfaceTokenizer，用于把文本字符串编码为 token ids
+        num_views: 摄像头视角数量（DROID=3，AgiBot=3）
+        embodiment_tag_mapping: 机器人类型名称到 ID 的映射 (如 {"oxe_droid": 17, "agibot": 26, ...})
+
+    返回:
+        batch: dict，每个 key 对应一个 batched tensor
+            - "text": [B, max_length] int64, tokenized prompt ids
+            - "text_attention_mask": [B, max_length] int64, padding mask
+            - 其他 key: torch.from_numpy(np.stack(values))
+    """
     batch = {}
     keys = features[0].keys()
 
     for key in keys:
         if key == "text":
+            # ==================== 处理文本 prompt ====================
+            # 每个样本的 text 是一个字符串（原始 language instruction），
+            # 需要：1) 解析字符串格式  2) 拼接机器人特定的视角描述模板  3) tokenize
             output_values = []
             for elem in features:
                 item = elem[key]
                 try:
+                    # --- Step 1: 解析原始 prompt 字符串 ---
+                    # ast.literal_eval() 是 Python 标准库函数，安全地将字符串解析为 Python 对象。
+                    # 因为数据集中的 text 字段格式不统一，可能是：
+                    #   - 普通字符串: "pick up the cup"
+                    #   - 字符串化的列表: "['pick up the cup', 'grab the cup']"
+                    #   - 字符串化的元组: "('pick up the cup',)"
+                    # ast.literal_eval 会把这些还原成实际的 Python 对象 (str / list / tuple)
                     parsed_item = ast.literal_eval(item)
-                    # Handle different return types from ast.literal_eval
+                    # 如果解析出来是 list 或 tuple，取第一个元素作为 prompt
                     if isinstance(parsed_item, (list, tuple)):
                         processed_item = str(parsed_item[0])
                     else:
-                        # If it's already a scalar (string, float, int, etc.), convert to string
+                        # 如果已经是标量（字符串、数字等），直接转字符串
                         processed_item = str(parsed_item)
-                    
+
+                    # --- Step 2: 根据 embodiment_id 拼接视角描述模板 ---
+                    # DreamZero 把多个摄像头画面拼成一张图送入视频模型，
+                    # 不同机器人的摄像头布局不同，所以需要在 prompt 里描述视角布局，
+                    # 让模型知道图像的哪个区域对应哪个摄像头。
+                    # 模板格式: "A multi-view video shows that a robot {prompt}
+                    #            The video is split into N views: {视角描述} The robot {prompt}"
                     if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
+                        # AgiBot G1: 4 视角 (头部、右手、左手、黑屏占位)
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
+                        # DROID Franka: 3 视角 (手腕、左外部、右外部)
                         processed_item = (
                             "A multi-view video shows that a robot "
                             + processed_item.lower()
@@ -117,18 +150,24 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                             + processed_item.lower()
                         )
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
+                        # GR1 人体数据: 单视角
                         processed_item = "A single view video shows that a human " + processed_item.lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.MECKA_HANDS.value]:
+                        # Mecka 手部数据: 单视角
                         processed_item = "A single view video shows that a human " + processed_item.lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.XDOF.value]:
+                        # XDOF: 4 视角 (同 AgiBot 布局)
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
+                        # YAM: 4 视角 (顶部、右侧、左侧、黑屏)
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + processed_item.lower()
                     else:
-                        raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.") 
-                    output_values.append(processed_item)  
+                        raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")
+                    output_values.append(processed_item)
                 except (ValueError, SyntaxError, TypeError):
-                    # If parsing fails or item is already a string, use it directly
+                    # --- 异常兜底: ast.literal_eval 解析失败 ---
+                    # 如果 text 字段不是合法的 Python 字面量（比如包含特殊字符），
+                    # 直接把原始 item 当字符串用，执行同样的模板拼接逻辑。
                     if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
@@ -139,7 +178,7 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                             + str(item).lower()
                         )
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
-                        item = "A single view video shows that a human " + str(item).lower() 
+                        item = "A single view video shows that a human " + str(item).lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.MECKA_HANDS.value]:
                         item = "A single view video shows that a human " + str(item).lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.XDOF.value]:
@@ -147,18 +186,19 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + str(item).lower()
                     else:
-                        raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")   
+                        raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")
                     output_values.append(item)
-            # print("output_values", output_values)
-            ids, mask = tokenizer(output_values, return_mask=True, add_special_tokens=True)
-            batch[key] = ids 
-            batch['text_attention_mask'] = mask
+
+            # 不再 tokenize，保留原始文本字符串供 debug 验证
+            batch["text_raw"] = output_values
+
         elif key == "text_negative":
-            values = [elem[key] for elem in features]
-            ids, mask = tokenizer(values, return_mask=True, add_special_tokens=True)
-            batch[key] = ids 
-            batch['text_attention_mask_negative'] = mask
+            # 训练时不使用 negative prompt，跳过 tokenize
+            pass
+
         else:
+            # ==================== 处理其他字段 (images, action, state, prompt_emb 等) ====================
+            # 都是 numpy array，直接 np.stack 后转 torch tensor
             values = [elem[key] for elem in features]
             batch[key] = torch.from_numpy(np.stack(values))
     return batch
@@ -510,6 +550,12 @@ class DreamTransform(InvertibleModalityTransform):
         language, is_lapa_instance, is_dream_instance, is_cotrain_instance = self._prepare_language(data)
         batch_data = {"images": images, "language": language}
         vlm_outputs = self._apply_vlm_processing(batch_data)
+
+        # 如果有预计算的 prompt_emb，取出与选中 language 对应的 embedding
+        if "prompt_emb_by_text" in data:
+            prompt_emb_by_text = data["prompt_emb_by_text"]
+            if language in prompt_emb_by_text:
+                transformed_data["prompt_emb"] = prompt_emb_by_text[language]
 
         # 2) Prepare state
         state, state_mask, _ = self._prepare_state(data)

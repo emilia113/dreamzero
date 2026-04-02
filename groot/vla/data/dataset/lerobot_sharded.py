@@ -1,5 +1,6 @@
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import time
 
@@ -12,7 +13,7 @@ import yaml
 
 from groot.vla.common.utils import get_frames_by_timestamps
 
-from .lerobot import LE_ROBOT_EPISODE_FILENAME, LeRobotMixtureDataset, LeRobotSingleDataset
+from .lerobot import LE_ROBOT_EPISODE_FILENAME, LeRobotMixtureDataset, LeRobotSingleDataset, METADATA_LANG_KEYS
 
 
 class ShardedLeRobotSingleDataset(LeRobotSingleDataset):
@@ -1540,3 +1541,175 @@ class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):
             dataset = self.datasets[dataset_idx]
             total_length += int(dataset.num_steps_per_shard * self.shard_sampling_rate)
         return total_length
+
+
+class ShardedLeRobotSubLangSingleActionChunkDatasetDROIDPreprocessed(
+    ShardedLeRobotSubLangSingleActionChunkDatasetDROID
+):
+    """
+    继承自 ShardedLeRobotSubLangSingleActionChunkDatasetDROID，
+    支持加载预计算的 text embeddings。
+
+    预计算文件由 scripts/precompute_text_embeddings.py 生成，
+    每个 task_index 对应一个 .pt 文件: {text_embeddings_dir}/{task_index:06d}.pt
+    每个文件包含 [512, 4096] bfloat16 tensor。
+
+    数据流变化:
+      原始: get_language() → 返回 text string → collate tokenize → forward encode_prompt (UMT5-XXL)
+      现在: get_language() → 返回 text string (不变，transform 仍需要)
+            + 额外返回 prompt_emb → collate 中传递 → forward 跳过 encode_prompt
+
+    使用方法:
+      1. 先运行 scripts/precompute_text_embeddings.py 生成 embedding 文件
+      2. 在训练配置中将 dataset_class 替换为此类
+      3. 传入 text_embeddings_dir 参数
+    """
+
+    def __init__(
+        self,
+        *args,
+        text_embeddings_dir: str = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        assert text_embeddings_dir is not None, (
+            "text_embeddings_dir is required. "
+            "Run scripts/precompute_text_embeddings.py first."
+        )
+        self.text_embeddings_dir = text_embeddings_dir
+
+        # 验证 embedding 目录存在
+        assert os.path.isdir(text_embeddings_dir), (
+            f"text_embeddings_dir not found: {text_embeddings_dir}"
+        )
+
+        # 加载 metadata 验证配置一致性
+        # 来源: scripts/precompute_text_embeddings.py Step 5
+        metadata_path = os.path.join(text_embeddings_dir, "metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                self._emb_metadata = json.load(f)
+            print(f"[Preprocessed] Loaded text embeddings metadata: "
+                  f"{self._emb_metadata['num_tasks']} tasks, "
+                  f"shape {self._emb_metadata['embedding_shape']}")
+        else:
+            print(f"[Preprocessed] Warning: metadata.json not found in {text_embeddings_dir}")
+            self._emb_metadata = None
+
+        # 缓存已加载的 embedding，避免重复读磁盘
+        # key: task_index (int), value: [512, 4096] tensor
+        self._emb_cache = {}
+
+    def _load_text_embedding(self, task_index: int) -> torch.Tensor:
+        """
+        按 task_index 加载预计算的 text embedding。
+
+        来源: scripts/precompute_text_embeddings.py 的输出格式
+          文件: {text_embeddings_dir}/{task_index:06d}.pt
+          内容: [512, 4096] bfloat16 tensor
+          编码逻辑复现自 wan_flow_matching_action_tf.py encode_prompt() line 547-553
+        """
+        if task_index in self._emb_cache:
+            return self._emb_cache[task_index]
+
+        emb_path = os.path.join(self.text_embeddings_dir, f"{task_index:06d}.pt")
+        if not os.path.exists(emb_path):
+            raise FileNotFoundError(
+                f"Text embedding not found for task_index={task_index}: {emb_path}. "
+                f"Run scripts/precompute_text_embeddings.py first."
+            )
+
+        emb = torch.load(emb_path, map_location="cpu")  # [512, 4096] bfloat16
+        self._emb_cache[task_index] = emb
+        return emb
+
+    def get_language(
+        self,
+        trajectory_id: int,
+        key: str,
+        step_indices: np.ndarray,
+    ) -> list[str]:
+
+        """Get the language annotation data for a trajectory by step indices.
+
+        Args:
+            trajectory_id (int): The ID of the trajectory.
+            key (str): The key of the annotation.
+            step_indices (np.ndarray): The step indices to retrieve data for.
+
+        Returns:
+            list[str]: The annotation data for the trajectory and step indices.
+                If no matching data is found, return empty strings.
+        """
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        # Get the trajectory index
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        # Get the maximum length of the trajectory
+        max_length = self.trajectory_lengths[trajectory_index]
+        # Get the end times corresponding to the closest indices
+        step_indices = np.maximum(step_indices, 0)
+        step_indices = np.minimum(step_indices, max_length - 1)
+        # Get the annotations
+        assert key.startswith(
+            "annotation."
+        ), f"Language key must start with 'annotation.', got {key}"
+        subkey = key.replace("annotation.", "")
+        # print("subkey", subkey)
+        
+        # Check if this is a metadata-based language key (detailed_global_instruction_medium/concise)
+        if subkey in METADATA_LANG_KEYS:
+            # print("return metadata language")
+            return self._get_language_from_metadata(trajectory_id, subkey, len(step_indices))
+        
+        # Otherwise, load from parquet columns (original behavior)
+        annotation_meta = self.lerobot_modality_meta.annotation
+        assert annotation_meta is not None, f"Annotation metadata is None for {subkey}"
+        assert (
+            subkey in annotation_meta
+        ), f"Annotation key {subkey} not found in metadata, available annotation keys: {annotation_meta.keys()}"
+        subkey_meta = annotation_meta[subkey]
+        original_key = subkey_meta.original_key
+        if original_key is None:
+            original_key = key
+        if pd.api.types.is_numeric_dtype(self.curr_traj_data[original_key]):
+            # Stored as list of integers
+            task_indices: list[int] = self.curr_traj_data[original_key].iloc[step_indices].tolist()
+            self._current_task_indices[key] = task_indices
+            return self.tasks.loc[task_indices]["task"].tolist()
+        else:
+            # Stored as list of strings
+            return self.curr_traj_data[original_key].iloc[step_indices].astype(str).tolist()
+        
+
+
+
+    def get_step_data(self, trajectory_id: int, indices: dict) -> dict | None:
+        """
+        重写 get_step_data: 在原始数据基础上附加 prompt_emb_by_text 字段。
+
+        附加字段:
+          step_data["prompt_emb_by_text"]: dict[str, numpy array [512, 4096]]
+          key 是文本字符串，value 是对应的预计算 embedding。
+          Transform 中 _prepare_language 选中哪个文本，就用对应的 embedding。
+        """
+        self._current_task_indices = {}
+
+        step_data = super().get_step_data(trajectory_id, indices)
+        if step_data is None:
+            return None
+
+        # 为每个 language key 加载对应的 embedding，用文本字符串做 key
+        if self._current_task_indices:
+            prompt_emb_by_text = {}
+            for lang_key, task_indices in self._current_task_indices.items():
+                if task_indices and lang_key in step_data:
+                    task_index = task_indices[0]
+                    text = step_data[lang_key]
+                    if isinstance(text, list):
+                        text = text[0]
+                    emb = self._load_text_embedding(task_index)
+                    prompt_emb_by_text[text] = emb.numpy()
+            if prompt_emb_by_text:
+                step_data["prompt_emb_by_text"] = prompt_emb_by_text
+
+        return step_data
