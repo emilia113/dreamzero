@@ -1708,7 +1708,7 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROIDPreprocessed(
                     if isinstance(text, list):
                         text = text[0]
                     emb = self._load_text_embedding(task_index)
-                    prompt_emb_by_text[text] = emb.numpy()
+                    prompt_emb_by_text[text] = emb.float().numpy()
             if prompt_emb_by_text:
                 step_data["prompt_emb_by_text"] = prompt_emb_by_text
 
