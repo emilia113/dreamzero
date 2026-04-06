@@ -1130,114 +1130,120 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         return relative_action_data
     
     def _uniform_sample_from_language_ranges(
-        self, 
-        step_indices: np.ndarray, 
-        language_annotations: np.ndarray, 
+        self,
+        step_indices: np.ndarray,
+        language_annotations: np.ndarray,
         trajectory_length: int
     ) -> np.ndarray:
-        """Uniformly sample from language-consistent ranges based on the first index's language.
-        
+        """为视频模型采样帧索引，保证同一语言指令且输出 8n+1 帧格式。
+
+        整体流程:
+          1. 以 first_idx 为中心，记录其语言标注 target_language
+          2. 每隔 24 步向前后扩展 anchor，每个 anchor 采 8 帧 (stride=3, offset 0~21)
+          3. 扩展停止条件（前后独立）：anchor 越界 / 语言变化 / 总帧数达上限
+          4. 末尾凑 8n+1 格式：加 1 帧或砍 7 帧（砍掉等于丢 1 个 chunk）
+          5. 最终 chunk 数 = (帧数 - 1) // 8，存入 _current_num_chunks 供 state/action 对齐
+
+        帧数与 chunk 的关系:
+          max_chunk_size=4 → 目标 33 帧 (8*4+1) → 4 chunk
+          如果末尾 +3 越界，砍 7 帧 → 25 帧 → 3 chunk（丢 1 个 chunk）
+
         Args:
-            step_indices (np.ndarray): Original step indices to sample.
-            language_annotations (np.ndarray): Language annotations for each step in the trajectory.
-            trajectory_length (int): Total length of the trajectory.
-            
+            step_indices: 原始采样索引，只用 step_indices[0] 作为中心点
+            language_annotations: 每个 step 的语言标注 (int)，同一 episode 内可能变化
+            trajectory_length: episode 总长度
         Returns:
-            np.ndarray: New indices sampled uniformly from the language-consistent range of the first index.
+            8n+1 格式的帧索引数组，n = chunk 数
         """
         if len(step_indices) == 0:
             return np.array([])
-        
-        # Use only the first index to determine the target language
+
+        # ===== 1. 确定中心 anchor 及其语言标注 =====
         first_idx = max(0, min(step_indices[0], trajectory_length - 1))
         target_language = language_annotations[first_idx]
-        
-        # Build sampled indices by moving in ±32-frame steps from first_idx
-        # and adding 4 frames at 8-frame strides for each step, while:
-        # - staying within trajectory bounds,
-        # - keeping language consistent with target_language at the anchor step,
-        # - and limiting the total collected frames to 81.
+
+        # ===== 2. 参数定义 =====
+        # 每个 chunk 对应 1 个 anchor，每个 anchor 采 8 帧 (stride=3)
+        # 目标总帧数 = 8 * max_chunk_size + 1 (8n+1 格式，最后 +1 在后面处理)
         max_frames = 8 * self.max_chunk_size + 1
-        per_step_offsets = [0, 3, 6, 9, 12, 15, 18, 21]
+        per_step_offsets = [0, 3, 6, 9, 12, 15, 18, 21]  # 8 帧，覆盖 anchor 到 anchor+21
         sampled_list: list[int] = []
-        
+
+        # ===== 3. 单个 anchor 的采帧逻辑 =====
         def add_step_set(anchor_index: int) -> None:
-            # Only add a complete 4-frame set if it fully fits and capacity allows
-            # Require full 32-frame window to exist for alignment with action/state
             nonlocal sampled_list
+            # anchor+23 < trajectory_length: 检查 24 帧窗口在 episode 内
+            # 用 +23 而非 +21 是为了和 action/state 的 24 帧 chunk 窗口对齐
             if anchor_index < 0 or anchor_index + 23 >= trajectory_length:
                 return
+            # 加上这 8 帧不能超过 max_frames 上限
             if len(sampled_list) + len(per_step_offsets) > max_frames:
                 return
             for offset in per_step_offsets:
                 idx = anchor_index + offset
                 sampled_list.append(int(idx))
-        
-        # Always include the set at the first_idx
+
+        # ===== 4. 从 first_idx 开始双向扩展 =====
+        # 先采中心 anchor
         add_step_set(first_idx)
-        
-        # Expand outward in both directions in 32-frame steps
+
+        # 每步 ±24 交替向前后扩展，前后方向独立停止
+        # anchor 间距 24 = action 的 1 个 chunk 长度
         step = 1
         back_done = False
         fwd_done = False
         while len(sampled_list) < max_frames and (not back_done or not fwd_done):
-            # Backward step
             if not back_done:
                 back_anchor = first_idx - 24 * step
                 if back_anchor < 0:
-                    back_done = True
+                    back_done = True  # 越界停止
                 elif language_annotations[back_anchor] != target_language:
-                    back_done = True
+                    back_done = True  # 语言变化停止
                 else:
                     add_step_set(back_anchor)
-            # Forward step
             if len(sampled_list) >= max_frames:
                 break
             if not fwd_done:
                 fwd_anchor = first_idx + 24 * step
                 if fwd_anchor >= trajectory_length:
-                    fwd_done = True
+                    fwd_done = True  # 越界停止
                 elif language_annotations[fwd_anchor] != target_language:
-                    fwd_done = True
+                    fwd_done = True  # 语言变化停止
                 else:
                     add_step_set(fwd_anchor)
             step += 1
-        
-        # De-duplicate and sort ascending for stable ordering
+
+        # ===== 5. 去重排序 =====
         if len(sampled_list) == 0:
             return np.array([])
         unique_sorted = np.array(sorted(set(sampled_list)), dtype=int)
-        # Ensure we return at most 81 frames
         if unique_sorted.size > max_frames:
             unique_sorted = unique_sorted[:max_frames]
-        
-        # Convert to 4n+1 format by adding one more frame at the end with 8-frame stride
+
+        # ===== 6. 凑 8n+1 格式 =====
+        # 此时有 8n 帧 (n 个 anchor × 8 帧)，需要变成 8n+1
         if unique_sorted.size > 0:
-            # Get the last index and add one more frame with 8-frame stride
             last_idx = unique_sorted[-1]
-            additional_idx = last_idx + 3
-            
-            # Only add if it doesn't exceed trajectory bounds and max_frames
+            additional_idx = last_idx + 3  # 在末尾追加 1 帧 (stride=3)
+
             if additional_idx < trajectory_length and unique_sorted.size < max_frames:
+                # 正常：追加成功，8n → 8n+1
                 unique_sorted = np.append(unique_sorted, additional_idx)
             else:
-                # Trim to 8n+1 format. Require at least 9 frames so (noisy_frames-1)//num_frame_per_block >= 1
-                # for action/state model invariant (CausalWanModel); otherwise return empty so sample is skipped.
+                # 追加失败（越界或已满），砍掉尾部 7 帧: 8n → 8(n-1)+1
+                # 相当于丢掉最后一个 chunk
                 if unique_sorted.size <= 8:
-                    return np.array([])
+                    return np.array([])  # 只有 1 个 chunk，砍完就没了
                 unique_sorted = unique_sorted[:-7]
-        
-        # ensure that unique_sorted has 4n+1 frames
-        assert unique_sorted.size % 8 == 1, f"unique_sorted size {unique_sorted.size} is not 4n+1"
-        
-        # Store the number of chunks for alignment with action/state
+
+        assert unique_sorted.size % 8 == 1, f"unique_sorted size {unique_sorted.size} is not 8n+1"
+
+        # ===== 7. 记录 chunk 数供 state/action 对齐 =====
         num_video_chunks = (unique_sorted.size - 1) // 8
         if not hasattr(self, '_current_num_chunks'):
             self._current_num_chunks = {}
-        # Use first_idx as a key to track the current sample's chunk count
         self._current_num_chunks[first_idx] = num_video_chunks
-        
-        # print("unique_sorted size", unique_sorted.size, "num_video_chunks", num_video_chunks)
+
         return unique_sorted
 
 
