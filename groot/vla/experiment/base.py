@@ -389,9 +389,9 @@ class BaseTrainer(transformers.Trainer):
             output = super().training_step(model, inputs)
 
         time_taken = time.time() - start_time
-        print(
-            f"Rank {self.global_rank} time taken for training_step {self.current_step}: {time_taken:.2f} seconds"
-        )
+        # print(
+        #     f"Rank {self.global_rank} time taken for training_step {self.current_step}: {time_taken:.2f} seconds"
+        # )
 
         if enable_profile:
             trace_path = f"{self.torch_profile_dir}/trace_rank_{self.global_rank}_step_{self.current_step}.json.gz"

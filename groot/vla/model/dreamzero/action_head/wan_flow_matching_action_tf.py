@@ -625,7 +625,7 @@ class WANPolicyHead(ActionHead):
         videos = data["images"]
 
         videos = rearrange(videos, "b t h w c -> b c t h w")
-        print("videos", videos.shape)
+        # print("videos", videos.shape)
         
 
         if videos.dtype == torch.uint8:
