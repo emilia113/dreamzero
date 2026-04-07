@@ -17,6 +17,48 @@ import time
 
 from groot.vla.data.schema import DatasetMetadata, EmbodimentTag
 from groot.vla.data.transform import ComposedModalityTransform
+import copy
+import shutil
+
+
+def _patch_config_json_for_inference(model_dir: Path):
+    """推理时临时将 config.json 中的 preprocessed action head 替换为原版（含 text_encoder）。
+    返回 True 表示做了修改（需要调用 _restore_config_json 恢复）。"""
+    config_path = model_dir / "config.json"
+    if not config_path.exists():
+        return False
+    with open(config_path, "r") as f:
+        config_dict = json.load(f)
+    ah_cfg = config_dict.get("action_head_cfg", {})
+    _tgt = ah_cfg.get("_target_", "")
+    _cfg_tgt = ah_cfg.get("config", {}).get("_target_", "") if isinstance(ah_cfg.get("config"), dict) else ""
+    if "preprocessed" not in _tgt and "preprocessed" not in _cfg_tgt:
+        return False
+    # 备份原文件
+    shutil.copy2(config_path, model_dir / "config.json.bak")
+    print("[sim_policy] Auto-replacing preprocessed action head with original (adds text_encoder)")
+    if "preprocessed" in _tgt:
+        ah_cfg["_target_"] = _tgt.replace("_preprocessed", "")
+    if "preprocessed" in _cfg_tgt:
+        ah_cfg["config"]["_target_"] = _cfg_tgt.replace("_preprocessed", "")
+    if isinstance(ah_cfg.get("config"), dict) and not ah_cfg["config"].get("text_encoder_cfg"):
+        ah_cfg["config"]["text_encoder_cfg"] = {
+            "_target_": "groot.vla.model.dreamzero.modules.wan_video_text_encoder.WanTextEncoder",
+            "_convert_": "object",
+            "text_encoder_pretrained_path": ah_cfg["config"].get("text_encoder_pretrained_path"),
+        }
+    config_dict["action_head_cfg"] = ah_cfg
+    with open(config_path, "w") as f:
+        json.dump(config_dict, f, indent=2)
+    return True
+
+
+def _restore_config_json(model_dir: Path):
+    """恢复 config.json 的备份。"""
+    bak_path = model_dir / "config.json.bak"
+    if bak_path.exists():
+        shutil.move(str(bak_path), str(model_dir / "config.json"))
+        print("[sim_policy] Restored original config.json")
 
 
 class ModelManager:
@@ -253,25 +295,6 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         exp_cfg_dir = model_dir / "experiment_cfg"
         train_cfg_path = exp_cfg_dir / "conf.yaml"
         train_cfg = OmegaConf.load(train_cfg_path)
-        # 推理时自动将 preprocessed action head 替换为原版（含 text_encoder）
-        _ah_cfg = OmegaConf.select(train_cfg, "action_head_cfg", default=None)
-        if _ah_cfg is not None:
-            _tgt = OmegaConf.select(_ah_cfg, "_target_", default="")
-            _cfg_tgt = OmegaConf.select(_ah_cfg, "config._target_", default="")
-            if "preprocessed" in _tgt or "preprocessed" in _cfg_tgt:
-                print("[sim_policy] Auto-replacing preprocessed action head with original (adds text_encoder)")
-                if "preprocessed" in _tgt:
-                    train_cfg.action_head_cfg._target_ = _tgt.replace("_preprocessed", "")
-                if "preprocessed" in _cfg_tgt:
-                    train_cfg.action_head_cfg.config._target_ = _cfg_tgt.replace("_preprocessed", "")
-                # 补上 text_encoder_cfg（preprocessed 版本删掉了）
-                if not OmegaConf.select(_ah_cfg, "config.text_encoder_cfg", default=None):
-                    text_enc_path = OmegaConf.select(train_cfg, "text_encoder_pretrained_path", default=None)
-                    train_cfg.action_head_cfg.config.text_encoder_cfg = {
-                        "_target_": "groot.vla.model.dreamzero.modules.wan_video_text_encoder.WanTextEncoder",
-                        "_convert_": "object",
-                        "text_encoder_pretrained_path": text_enc_path,
-                    }
         if tokenizer_path_override is not None:
             _update_tokenizer_path_in_config(train_cfg, tokenizer_path_override)
         self.train_cfg = train_cfg
@@ -293,7 +316,34 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             model_target = train_cfg.model._target_
             
         self.model_target = model_target
-        
+
+        # GrootSimPolicy 只在推理时使用，若 conf.yaml 配置了 eval_action_head 则替换 config.json 中的 action head
+        eval_action_head = train_cfg.get("eval_action_head", None)
+        self._config_json_patched = False
+        if eval_action_head:
+            config_json_path = model_dir / "config.json"
+            with open(config_json_path, "r") as f:
+                config_dict = json.load(f)
+            ah_cfg = config_dict.get("action_head_cfg", {})
+            old_tgt = ah_cfg.get("_target_", "")
+            if eval_action_head not in old_tgt:
+                import shutil
+                shutil.copy2(config_json_path, model_dir / "config.json.bak")
+                print(f"[sim_policy] Replacing action head with eval_action_head: {eval_action_head}")
+                ah_cfg["_target_"] = eval_action_head + ".WANPolicyHead"
+                if isinstance(ah_cfg.get("config"), dict):
+                    ah_cfg["config"]["_target_"] = eval_action_head + ".WANPolicyHeadConfig"
+                    if not ah_cfg["config"].get("text_encoder_cfg"):
+                        ah_cfg["config"]["text_encoder_cfg"] = {
+                            "_target_": "groot.vla.model.dreamzero.modules.wan_video_text_encoder.WanTextEncoder",
+                            "_convert_": "object",
+                            "text_encoder_pretrained_path": "./ckpt/Wan2.1-I2V-14B-480P/models_t5_umt5-xxl-enc-bf16.pth",
+                        }
+                config_dict["action_head_cfg"] = ah_cfg
+                with open(config_json_path, "w") as f:
+                    json.dump(config_dict, f, indent=2)
+                self._config_json_patched = True
+
         if model_config_overrides is not None and len(model_config_overrides) != 0:
             print(f"Applying model config overrides: {model_config_overrides}")
             # Only apply new logic if there are config overrides
@@ -337,6 +387,14 @@ class GrootSimPolicy(BaseGrootSimPolicy):
                 cls = getattr(importlib.import_module(cls_module), cls_name)
                 from_pretrained = getattr(cls, "from_pretrained")
                 model = from_pretrained(model_path)
+
+        # 恢复 config.json
+        if self._config_json_patched:
+            import shutil
+            bak_path = model_dir / "config.json.bak"
+            if bak_path.exists():
+                shutil.move(str(bak_path), str(model_dir / "config.json"))
+                print("[sim_policy] Restored original config.json")
 
         model.eval()
         model.requires_grad_(False)
