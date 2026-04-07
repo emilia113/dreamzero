@@ -77,8 +77,6 @@ ddp_find_unused_parameters: false
 ddp_bucket_cap_mb: 100
 ray_num_workers: ???
 eval_bf16: true
-# 推理时使用的 action head，null 表示使用训练时的 action head
-eval_action_head: "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf"
 torch_compile_mode: null
 
 pretrained_model_path: null
