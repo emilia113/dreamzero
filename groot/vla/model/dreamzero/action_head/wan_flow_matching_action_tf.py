@@ -1320,7 +1320,7 @@ class WANPolicyHead(ActionHead):
                 # x0 prediction → convert to velocity
                 # velocity = (noisy - x0_pred) / sigma, from: noisy = (1-σ)*x0 + σ*noise
                 sigma_t = sample_scheduler_action.sigmas[index]
-                action_velocity = (noisy_input_action - flow_pred_cond_action) / (sigma_t + 0.01)
+                action_velocity = (noisy_input_action - flow_pred_cond_action) / sigma_t
             elif self.config.action_prediction_type == "velocity":
                 # velocity prediction: model directly outputs velocity
                 action_velocity = flow_pred_cond_action
