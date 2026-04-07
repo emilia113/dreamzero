@@ -61,6 +61,80 @@ def _restore_config_json(model_dir: Path):
         print("[sim_policy] Restored original config.json")
 
 
+def collate_eval(features, tokenizer, num_views=3, embodiment_tag_mapping=None):
+    """推理专用 collate：带 tokenize，产出 text (token ids) 和 text_attention_mask。"""
+    import ast
+    from groot.vla.data.schema import EmbodimentTag
+    batch = {}
+    keys = features[0].keys()
+
+    for key in keys:
+        if key == "text":
+            output_values = []
+            for elem in features:
+                item = elem[key]
+                try:
+                    parsed_item = ast.literal_eval(item)
+                    if isinstance(parsed_item, (list, tuple)):
+                        processed_item = str(parsed_item[0])
+                    else:
+                        processed_item = str(parsed_item)
+
+                    if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
+                        processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
+                        processed_item = (
+                            "A multi-view video shows that a robot "
+                            + processed_item.lower()
+                            + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera. During training, one of the two bottom exterior views may be a black screen (dropped view). The robot "
+                            + processed_item.lower()
+                        )
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
+                        processed_item = "A single view video shows that a human " + processed_item.lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.MECKA_HANDS.value]:
+                        processed_item = "A single view video shows that a human " + processed_item.lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.XDOF.value]:
+                        processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
+                        processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + processed_item.lower()
+                    else:
+                        raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")
+                    output_values.append(processed_item)
+                except (ValueError, SyntaxError, TypeError):
+                    if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
+                        item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OXE_DROID.value]:
+                        item = (
+                            "A multi-view video shows that a robot "
+                            + str(item).lower()
+                            + " The video is split into three views: The top view shows the camera view from the robot's wrist, the bottom-left view shows the camera view from the left exterior camera, and the bottom-right view shows the camera view from the right exterior camera. During training, one of the two bottom exterior views may be a black screen (dropped view). The robot "
+                            + str(item).lower()
+                        )
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.GR1_UNIFIED.value]:
+                        item = "A single view video shows that a human " + str(item).lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.MECKA_HANDS.value]:
+                        item = "A single view video shows that a human " + str(item).lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.XDOF.value]:
+                        item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
+                        item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + str(item).lower()
+                    else:
+                        raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")
+                    output_values.append(item)
+            ids, mask = tokenizer(output_values, return_mask=True, add_special_tokens=True)
+            batch[key] = ids
+            batch['text_attention_mask'] = mask
+        elif key == "text_negative":
+            values = [elem[key] for elem in features]
+            ids, mask = tokenizer(values, return_mask=True, add_special_tokens=True)
+            batch[key] = ids
+            batch['text_attention_mask_negative'] = mask
+        else:
+            values = [elem[key] for elem in features]
+            batch[key] = torch.from_numpy(np.stack(values))
+    return batch
+
+
 class ModelManager:
     """
     Manages model loading/offloading to handle memory efficiently when using multiple models.
@@ -529,6 +603,11 @@ class GrootSimPolicy(BaseGrootSimPolicy):
                 print(f"WARNING: No per-horizon statistics found despite relative_action_per_horizon=True")
         
         eval_transform.eval()
+        # 推理时替换 DreamTransform 的 collate 为带 tokenize 的版本
+        for t in eval_transform.transforms:
+            if hasattr(t, 'set_collate_fn'):
+                t.set_collate_fn(collate_eval)
+                print("[sim_policy] Replaced collate with collate_eval (with tokenization)")
         self.eval_transform = eval_transform
 
         # 3. Load horizons needed

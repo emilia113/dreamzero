@@ -267,10 +267,16 @@ class DreamTransform(InvertibleModalityTransform):
         super().__init__(**kwargs)
         # Initialize the tokenizer
         self._tokenizer = HuggingfaceTokenizer(
-            name=self.tokenizer_path, 
-            seq_len=self.max_length, 
+            name=self.tokenizer_path,
+            seq_len=self.max_length,
             clean='whitespace'
         )
+        # 默认使用训练 collate，推理时可通过 set_collate_fn 替换
+        self._collate_fn = collate
+
+    def set_collate_fn(self, fn):
+        """替换 collate 函数，用于推理时切换为带 tokenize 的版本。"""
+        self._collate_fn = fn
     
     @property
     def tokenizer(self):
@@ -656,7 +662,7 @@ class DreamTransform(InvertibleModalityTransform):
         data_split = [tree.map_structure(lambda x: x[i], data) for i in range(batch_size)]
         # Process each element.
         data_split_processed = [self.apply_single(elem) for elem in data_split]
-        return collate(data_split_processed, self.tokenizer, self.num_views, self.embodiment_tag_mapping)
+        return self._collate_fn(data_split_processed, self.tokenizer, self.num_views, self.embodiment_tag_mapping)
 
     def apply(self, data: dict) -> dict:
         if not self.training and data["video"].ndim == 5:
