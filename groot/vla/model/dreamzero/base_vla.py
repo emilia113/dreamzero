@@ -551,25 +551,6 @@ class VLA(PreTrainedModel):
             config.action_head_cfg['defer_lora_injection'] = False
             print("config.action_head_cfg['defer_lora_injection'] disabled (set to False)")
 
-        # 推理时自动将 preprocessed action head 替换为原版（含 text_encoder）
-        ah_cfg = config.action_head_cfg
-        _tgt = ah_cfg.get("_target_", "")
-        _cfg_tgt = ah_cfg.get("config", {}).get("_target_", "") if isinstance(ah_cfg.get("config"), dict) else ""
-        if "preprocessed" in _tgt or "preprocessed" in _cfg_tgt:
-            print("[from_pretrained] Auto-replacing preprocessed action head with original (adds text_encoder)")
-            if "preprocessed" in _tgt:
-                ah_cfg["_target_"] = _tgt.replace("_preprocessed", "")
-            if "preprocessed" in _cfg_tgt:
-                ah_cfg["config"]["_target_"] = _cfg_tgt.replace("_preprocessed", "")
-            # 补上 text_encoder_cfg（preprocessed 版本删掉了）
-            if isinstance(ah_cfg.get("config"), dict) and not ah_cfg["config"].get("text_encoder_cfg"):
-                ah_cfg["config"]["text_encoder_cfg"] = {
-                    "_target_": "groot.vla.model.dreamzero.modules.wan_video_text_encoder.WanTextEncoder",
-                    "_convert_": "object",
-                    "text_encoder_pretrained_path": ah_cfg["config"].get("text_encoder_pretrained_path"),
-                }
-            config.action_head_cfg = ah_cfg
-
         # Instantiate model
         model = cls(config)
         print("model", model)
