@@ -253,6 +253,25 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         exp_cfg_dir = model_dir / "experiment_cfg"
         train_cfg_path = exp_cfg_dir / "conf.yaml"
         train_cfg = OmegaConf.load(train_cfg_path)
+        # 推理时自动将 preprocessed action head 替换为原版（含 text_encoder）
+        _ah_cfg = OmegaConf.select(train_cfg, "action_head_cfg", default=None)
+        if _ah_cfg is not None:
+            _tgt = OmegaConf.select(_ah_cfg, "_target_", default="")
+            _cfg_tgt = OmegaConf.select(_ah_cfg, "config._target_", default="")
+            if "preprocessed" in _tgt or "preprocessed" in _cfg_tgt:
+                print("[sim_policy] Auto-replacing preprocessed action head with original (adds text_encoder)")
+                if "preprocessed" in _tgt:
+                    train_cfg.action_head_cfg._target_ = _tgt.replace("_preprocessed", "")
+                if "preprocessed" in _cfg_tgt:
+                    train_cfg.action_head_cfg.config._target_ = _cfg_tgt.replace("_preprocessed", "")
+                # 补上 text_encoder_cfg（preprocessed 版本删掉了）
+                if not OmegaConf.select(_ah_cfg, "config.text_encoder_cfg", default=None):
+                    text_enc_path = OmegaConf.select(train_cfg, "text_encoder_pretrained_path", default=None)
+                    train_cfg.action_head_cfg.config.text_encoder_cfg = {
+                        "_target_": "groot.vla.model.dreamzero.modules.wan_video_text_encoder.WanTextEncoder",
+                        "_convert_": "object",
+                        "text_encoder_pretrained_path": text_enc_path,
+                    }
         if tokenizer_path_override is not None:
             _update_tokenizer_path_in_config(train_cfg, tokenizer_path_override)
         self.train_cfg = train_cfg
