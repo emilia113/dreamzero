@@ -103,7 +103,8 @@ class BICollector:
         # 1. 每个 block 的 forward hook：计算并记录 BI
         for idx in range(self.num_blocks):
             def make_hook(block_idx):
-                def hook_fn(module, inputs, output, **kwargs):
+                def hook_fn(module, args, kwargs, output):
+                    # with_kwargs=True 时签名: (module, args, kwargs, output)
                     # block 以关键字参数调用: block(x=x, e=e0, action_register_length=..., ...)
                     h_in = kwargs['x']          # [B, L, C]
                     h_out = output[0]            # (x_out, kv_cache) tuple 的第一个元素
