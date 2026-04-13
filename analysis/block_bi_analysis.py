@@ -89,8 +89,6 @@ class BICollector:
         # 当前推理状态
         self._current_chunk_id = -1
         self._timestep_counter = 0
-        self._current_seq_len = 0       # video token 长度
-        self._current_action_len = 0    # action token 长度
 
         # 数据容器: records[region][block_idx][timestep_idx] = [bi values across chunks]
         self.records = {
@@ -106,21 +104,18 @@ class BICollector:
         for idx in range(self.num_blocks):
             def make_hook(block_idx):
                 def hook_fn(module, inputs, output, **kwargs):
-                    # block 被以关键字参数调用: block(x=x, e=e0, ...)
-                    # 所以 inputs 可能为空，x 在 kwargs 中
-                    if inputs:
-                        h_in = inputs[0]
-                    else:
-                        h_in = kwargs.get('x', None)
-                        if h_in is None:
-                            return
-                    h_out = output[0] if isinstance(output, tuple) else output  # [B, L, C]
+                    # block 以关键字参数调用: block(x=x, e=e0, action_register_length=..., ...)
+                    h_in = kwargs['x']          # [B, L, C]
+                    h_out = output[0]            # (x_out, kv_cache) tuple 的第一个元素
+                    action_register_length = kwargs.get('action_register_length', None)
 
-                    seq_len = self._current_seq_len
-                    action_len = self._current_action_len
+                    if action_register_length is not None:
+                        seq_len = h_in.shape[1] - action_register_length
+                    else:
+                        seq_len = h_in.shape[1]
 
                     # Video 区域 BI
-                    if seq_len > 0 and h_in.shape[1] >= seq_len:
+                    if seq_len > 0:
                         cos_video = F.cosine_similarity(
                             h_in[:, :seq_len].float(),
                             h_out[:, :seq_len].float(), dim=-1)
@@ -129,10 +124,10 @@ class BICollector:
                             self._timestep_counter].append(bi_video)
 
                     # Action 区域 BI
-                    if action_len > 0 and h_in.shape[1] >= seq_len + action_len:
+                    if action_register_length is not None and action_register_length > 0:
                         cos_action = F.cosine_similarity(
-                            h_in[:, seq_len:seq_len + action_len].float(),
-                            h_out[:, seq_len:seq_len + action_len].float(),
+                            h_in[:, seq_len:].float(),
+                            h_out[:, seq_len:].float(),
                             dim=-1)
                         bi_action = 1.0 - cos_action.mean().item()
                         self.records['action'][block_idx][
@@ -142,25 +137,12 @@ class BICollector:
             h = self.model.blocks[idx].register_forward_hook(make_hook(idx), with_kwargs=True)
             self._hooks.append(h)
 
-        # 2. monkey patch _forward_blocks 以追踪 seq_len, action_length 和 timestep
+        # 2. monkey patch _forward_blocks 以追踪 timestep
         original_forward_blocks = self.model._forward_blocks
 
         def wrapped_forward_blocks(*args, **kwargs):
-            # _forward_blocks 可能以关键字参数调用: _forward_blocks(x=x, seq_len=seq_len, ...)
-            seq_len = kwargs.get('seq_len', args[1] if len(args) > 1 else 0)
-            self._current_seq_len = seq_len
-
-            action = kwargs.get('action', args[7] if len(args) > 7 else None)
-            if action is not None:
-                self._current_action_len = action.shape[1]
-            else:
-                self._current_action_len = 0
-
             result = original_forward_blocks(*args, **kwargs)
-
-            # 每次 _forward_blocks 完成后递增 timestep
             self._timestep_counter += 1
-
             return result
 
         self.model._forward_blocks = wrapped_forward_blocks
