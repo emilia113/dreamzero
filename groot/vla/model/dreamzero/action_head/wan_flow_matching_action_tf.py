@@ -143,7 +143,7 @@ class WANPolicyHeadConfig(PretrainedConfig):
     use_vlln: bool = field(default=True)
     defer_lora_injection: bool = field(default=False, metadata={"help": "Defer LoRA injection until after loading pretrained weights."})
     # Action prediction type: "x0" = model outputs clean action, "velocity" = model outputs velocity directly
-    action_prediction_type: str = field(default="x0", metadata={"help": "Action prediction type: 'x0' (clean action) or 'velocity' (direct velocity)."})
+    action_prediction_type: str = field(default=None, metadata={"help": "Action prediction type: 'x0' (clean action) or 'velocity' (direct velocity). Must be explicitly set."})
 
     vl_self_attention_cfg: dict = field(default=None)
     text_encoder_cfg: dict = field(default=None)
