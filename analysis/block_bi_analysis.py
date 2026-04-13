@@ -105,10 +105,15 @@ class BICollector:
         # 1. 每个 block 的 forward hook：计算并记录 BI
         for idx in range(self.num_blocks):
             def make_hook(block_idx):
-                def hook_fn(module, inputs, output):
-                    # inputs: (x, e, freqs, ...) 其中 x 是第一个参数
-                    # output: (x_out, kv_cache) tuple
-                    h_in = inputs[0]  # [B, L, C]
+                def hook_fn(module, inputs, output, **kwargs):
+                    # block 被以关键字参数调用: block(x=x, e=e0, ...)
+                    # 所以 inputs 可能为空，x 在 kwargs 中
+                    if inputs:
+                        h_in = inputs[0]
+                    else:
+                        h_in = kwargs.get('x', None)
+                        if h_in is None:
+                            return
                     h_out = output[0] if isinstance(output, tuple) else output  # [B, L, C]
 
                     seq_len = self._current_seq_len
@@ -134,29 +139,24 @@ class BICollector:
                             self._timestep_counter].append(bi_action)
 
                 return hook_fn
-            h = self.model.blocks[idx].register_forward_hook(make_hook(idx))
+            h = self.model.blocks[idx].register_forward_hook(make_hook(idx), with_kwargs=True)
             self._hooks.append(h)
 
         # 2. monkey patch _forward_blocks 以追踪 seq_len, action_length 和 timestep
         original_forward_blocks = self.model._forward_blocks
 
-        def wrapped_forward_blocks(x, seq_len, *args, **kwargs):
-            # 记录 seq_len
+        def wrapped_forward_blocks(*args, **kwargs):
+            # _forward_blocks 可能以关键字参数调用: _forward_blocks(x=x, seq_len=seq_len, ...)
+            seq_len = kwargs.get('seq_len', args[1] if len(args) > 1 else 0)
             self._current_seq_len = seq_len
 
-            # 通过 action 参数推断 action_length
-            # _forward_blocks 签名:
-            # (x, seq_len, freqs, timestep, context, clip_feature, embodiment_id,
-            #  action, timestep_action, state, kv_cache, current_start_frame)
-            action = kwargs.get('action', None)
-            if action is None and len(args) >= 6:
-                action = args[5]  # positional: action is 8th param (index 5 after x, seq_len)
+            action = kwargs.get('action', args[7] if len(args) > 7 else None)
             if action is not None:
                 self._current_action_len = action.shape[1]
             else:
                 self._current_action_len = 0
 
-            result = original_forward_blocks(x, seq_len, *args, **kwargs)
+            result = original_forward_blocks(*args, **kwargs)
 
             # 每次 _forward_blocks 完成后递增 timestep
             self._timestep_counter += 1
